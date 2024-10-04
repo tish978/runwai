@@ -14,6 +14,10 @@ import random
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import pandas as pd
+import numpy as np
 
 
 # Define constants
@@ -203,6 +207,30 @@ async def async_predict_user_like(item_id: str):
     except Exception as e:
         print(f"Error: {str(e)}")
 
+
+# Content-Based Recommendation System
+def recommend_items(liked_items, clothing_data, cosine_sim):
+    recommended_items = set()
+
+    for item_id in liked_items:
+        # Find the index of the liked item in the clothing_data DataFrame
+        item_idx = clothing_data[clothing_data['clothing_id'] == item_id].index[0]
+
+        # Get similarity scores for this item
+        similarity_scores = list(enumerate(cosine_sim[item_idx]))
+
+        # Sort items by similarity score
+        similarity_scores = sorted(similarity_scores, key=lambda x: x[1], reverse=True)
+
+        # Get the index of the top similar item (excluding the liked item itself)
+        similar_items_indices = [i for i, _ in similarity_scores[1:2]]  # Pick only one similar item
+
+        # Add the similar item to the recommendation list
+        recommended_items.update(clothing_data.iloc[similar_items_indices]['clothing_id'].tolist())
+
+    return list(recommended_items)
+
+
 @app.options("/recommend")
 async def options_recommend():
     """
@@ -219,28 +247,57 @@ async def options_recommend():
 @app.get("/recommend")
 async def recommend_clothing(current_user: dict = Depends(get_current_user)):
     # Get user feedback history
-    user_feedback = await feedback_collection.find({"user_id": current_user["user_id"]}).to_list(100)
+    user_feedback = await feedback_collection.find({"user_id": current_user["user_id"], "liked": True}).to_list(100)
+    liked_items = [feedback["item_id"] for feedback in user_feedback]
+
+    if not liked_items:
+        raise HTTPException(status_code=404, detail="No liked items found for recommendation.")
+
+    # Fetch clothing data
+    clothing_items = await collection.find().to_list(100)
+    clothing_data = pd.DataFrame(clothing_items)
+
+    # Build the content-based recommendation engine
+    clothing_data['combined_features'] = clothing_data.apply(lambda x: f"{x['item_name']} {x['brand']} {x['category']}", axis=1)
+    tfidf_vectorizer = TfidfVectorizer(stop_words='english')
+    tfidf_matrix = tfidf_vectorizer.fit_transform(clothing_data['combined_features'])
+    cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+
+    # Get recommendations based on liked items
+    recommended_items = recommend_items(liked_items, clothing_data, cosine_sim)
+
+    if not recommended_items:
+        raise HTTPException(status_code=404, detail="No recommendations available.")
+
+    # Convert the top recommended item to dict for JSONResponse (take only the first item)
+    top_recommended_clothing = clothing_data[clothing_data['clothing_id'].isin(recommended_items[:1])].to_dict(orient="records")
+
+    if top_recommended_clothing:
+        # Ensure ObjectId is converted to string and handle NaN or infinite values for the top item
+        top_item = top_recommended_clothing[0]
+        if "_id" in top_item:
+            top_item["_id"] = str(top_item["_id"])  # Convert ObjectId to string
+        # Replace NaN or infinite values with a default value
+        for key, value in top_item.items():
+            if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+                top_item[key] = 0 if isinstance(value, float) else ""  # Replace with 0 for float or empty string
+
+        # Set CORS headers for the response
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true",
+        }
+
+        print(top_item)
+        return JSONResponse(content={"recommended_item": top_item}, headers=headers)
     
-    # Simple recommendation logic: Show a random clothing item that hasn't been rated yet
-    all_clothing_items = await collection.find().to_list(100)
-    rated_items = {feedback["item_id"] for feedback in user_feedback}
-    unrated_items = [item for item in all_clothing_items if item["clothing_id"] not in rated_items]
-    
-    if not unrated_items:
-        raise HTTPException(status_code=404, detail="No more items to recommend.")
-    
-    random_item = random.choice(unrated_items)
-    
-    # Convert MongoDB ObjectId to string
-    random_item["_id"] = str(random_item["_id"])
-    
-    # Set CORS headers for the response
-    headers = {
-        "Access-Control-Allow-Origin": "http://localhost:3000",
-        "Access-Control-Allow-Credentials": "true",
-    }
-    
-    return JSONResponse(content=random_item, headers=headers)
+        
+
+    # If no items were recommended, raise an exception
+    raise HTTPException(status_code=404, detail="No recommendation could be made.")
+
+
+
 
 
 @app.options("/feedback")
@@ -257,6 +314,7 @@ async def options_feedback():
     return JSONResponse(content={}, headers=headers)
 
 
+# Route to submit feedback for a clothing item
 @app.post("/feedback")
 async def submit_feedback(feedback: FeedbackInput, current_user: dict = Depends(get_current_user)):
     feedback_data = {
@@ -267,12 +325,11 @@ async def submit_feedback(feedback: FeedbackInput, current_user: dict = Depends(
     }
     result = await feedback_collection.insert_one(feedback_data)
     
-    # Set CORS headers for the response
     headers = {
         "Access-Control-Allow-Origin": "http://localhost:3000",
         "Access-Control-Allow-Credentials": "true",
     }
-    
+
     if result.acknowledged:
         return JSONResponse(content={"message": "Feedback recorded"}, headers=headers)
     
