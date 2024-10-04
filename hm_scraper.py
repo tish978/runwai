@@ -54,7 +54,7 @@ def scrape_page(driver):
 
             # Find any span containing the price (text with '$')
             price_tag = product.find('span', string=lambda text: '$' in text if text else False)
-            price = price_tag.text.strip() if price_tag else 'N/A'
+            price = price_tag.text.strip().replace('$', '').strip() if price_tag else 'N/A'  # Remove the dollar sign
 
             # Extract product URL
             product_url = product.find('a', href=True)['href'] if product.find('a', href=True) else 'N/A'
@@ -67,7 +67,7 @@ def scrape_page(driver):
                 "clothing_id": generate_unique_clothing_id(),
                 "item_name": name,
                 "image_url": image_url,
-                "price": price,
+                "price": price,  # Cleaned price without dollar sign
                 "url": product_url,
                 "category": "Men's Clothing",
                 "brand": "H&M"
@@ -134,7 +134,7 @@ def scrape_all_pages(driver, max_scrolls_per_page=10):
 driver = webdriver.Edge(service=EdgeService(EdgeChromiumDriverManager().install()))
 
 # Navigate to H&M men's product page
-driver.get('https://www2.hm.com/en_us/men/shop-by-product/view-all.html?page=3')
+driver.get('https://www2.hm.com/en_us/men/shop-by-product/view-all.html?page=1')
 
 # Give the page some time to load initially
 time.sleep(5)
