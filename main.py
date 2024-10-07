@@ -18,9 +18,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import pandas as pd
 import numpy as np
+import stripe
 
 
 # Define constants
+stripe.api_key = "sk_test_51Q7NqdGpfvzWqvI6jGNrRWB1VwQR1xMkmOiET678WRzvEHiG3JxZXqn0D5omjOhPhOFHpLKLOuTDSbgFpLi10AiG00x7J4HxKv"
 SECRET_KEY = "your_secret_key"  # Change this to a secure value
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -84,6 +86,8 @@ class ClothingItem(BaseModel):
     colors_available: List[str]
     brand: str
     size: List[str]
+
+    
 
 class User(BaseModel):
     user_id: str
@@ -222,10 +226,10 @@ def recommend_items(liked_items, clothing_data, cosine_sim):
         # Sort items by similarity score
         similarity_scores = sorted(similarity_scores, key=lambda x: x[1], reverse=True)
 
-        # Get the index of the top similar item (excluding the liked item itself)
-        similar_items_indices = [i for i, _ in similarity_scores[1:2]]  # Pick only one similar item
+        # Get the index of the top similar item (excluding the liked item itself and already recommended/liked items)
+        similar_items_indices = [i for i, _ in similarity_scores[1:] if clothing_data.iloc[i]['clothing_id'] not in liked_items]
 
-        # Add the similar item to the recommendation list
+        # Add the similar item(s) to the recommendation list (making sure it's not already liked)
         recommended_items.update(clothing_data.iloc[similar_items_indices]['clothing_id'].tolist())
 
     return list(recommended_items)
@@ -291,8 +295,6 @@ async def recommend_clothing(current_user: dict = Depends(get_current_user)):
         print(top_item)
         return JSONResponse(content={"recommended_item": top_item}, headers=headers)
     
-        
-
     # If no items were recommended, raise an exception
     raise HTTPException(status_code=404, detail="No recommendation could be made.")
 
@@ -334,4 +336,57 @@ async def submit_feedback(feedback: FeedbackInput, current_user: dict = Depends(
         return JSONResponse(content={"message": "Feedback recorded"}, headers=headers)
     
     raise HTTPException(status_code=500, detail="Failed to record feedback")
+
+@app.options("/saved-items")
+async def options_feedback():
+    """
+    Handle the OPTIONS method for /feedback to allow CORS preflight requests.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+
+@app.get("/saved-items")
+async def get_saved_items(current_user: dict = Depends(get_current_user)):
+    """
+    Endpoint to get all saved/liked items for the current user.
+    """
+    # Fetch all liked items for the user
+    user_feedback = await feedback_collection.find({"user_id": current_user["user_id"], "liked": True}).to_list(100)
+    liked_items = [feedback["item_id"] for feedback in user_feedback]
+
+    if not liked_items:
+        raise HTTPException(status_code=404, detail="No liked items found.")
+
+    # Fetch clothing data for the liked items
+    clothing_items = await collection.find({"clothing_id": {"$in": liked_items}}).to_list(len(liked_items))
+    
+    if not clothing_items:
+        raise HTTPException(status_code=404, detail="No matching clothing items found.")
+
+    # Convert clothing items to a list of dictionaries
+    liked_clothing_data = pd.DataFrame(clothing_items).to_dict(orient="records")
+
+    # Ensure ObjectId is converted to string for each item and handle NaN/infinite values
+    for item in liked_clothing_data:
+        if "_id" in item:
+            item["_id"] = str(item["_id"])  # Convert ObjectId to string
+        # Replace NaN or infinite values
+        for key, value in item.items():
+            if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+                item[key] = 0 if isinstance(value, float) else ""  # Replace with 0 for float or empty string
+    
+    # Set CORS headers for the response
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Credentials": "true",
+    }
+
+    # Return the liked items
+    return JSONResponse(content={"liked_items": liked_clothing_data}, headers=headers)
 
