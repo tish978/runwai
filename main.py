@@ -53,6 +53,7 @@ db = client['runwai_db']
 collection = db['clothing_catalog']
 feedback_collection = db['user_feedback']  # Feedback collection
 user_collection = db['user']  # Users collection
+cart_collection = db['cart']
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
@@ -87,7 +88,12 @@ class ClothingItem(BaseModel):
     brand: str
     size: List[str]
 
-    
+# Model for CartItem
+class CartItem(BaseModel):
+    clothing_id: str
+    item_name: str
+    price: float
+    quantity: int = 1  # Default to 1 if not specified    
 
 class User(BaseModel):
     user_id: str
@@ -390,3 +396,160 @@ async def get_saved_items(current_user: dict = Depends(get_current_user)):
     # Return the liked items
     return JSONResponse(content={"liked_items": liked_clothing_data}, headers=headers)
 
+
+
+@app.options("/saved-items/remove")
+async def options_feedback():
+    """
+    Handle the OPTIONS method for /feedback to allow CORS preflight requests.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+
+# Route to remove an item from saved items (user feedback)
+@app.post("/saved-items/remove")
+async def remove_saved_item(item_id: str, current_user: dict = Depends(get_current_user)):
+    # Remove the item from the saved items (feedback) collection
+    result = await feedback_collection.delete_one({"user_id": current_user["user_id"], "item_id": item_id})
+
+    if result.deleted_count == 1:
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true",
+        }
+        return JSONResponse(content={"message": "Item removed from saved items"}, headers=headers)
+
+    raise HTTPException(status_code=404, detail="Item not found in saved items")
+
+
+
+@app.options("/cart/add")
+async def options_feedback():
+    """
+    Handle the OPTIONS method for /feedback to allow CORS preflight requests.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+
+from fastapi.responses import JSONResponse
+
+# Route to add an item to the cart
+@app.post("/cart/add")
+async def add_to_cart(cart_item: CartItem, current_user: dict = Depends(get_current_user)):
+    # Check if the item is already in the cart
+    existing_cart_item = await cart_collection.find_one({"user_id": current_user["user_id"], "clothing_id": cart_item.clothing_id})
+    
+    if existing_cart_item:
+        # Update the quantity of the existing item
+        new_quantity = existing_cart_item["quantity"] + cart_item.quantity
+        await cart_collection.update_one(
+            {"user_id": current_user["user_id"], "clothing_id": cart_item.clothing_id},
+            {"$set": {"quantity": new_quantity}}
+        )
+        
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true",
+        }
+        return JSONResponse(content={"message": "Item quantity updated in cart", "quantity": new_quantity}, headers=headers)
+    
+    # Add the new item to the cart
+    cart_data = {
+        "user_id": current_user["user_id"],
+        "clothing_id": cart_item.clothing_id,
+        "item_name": cart_item.item_name,
+        "price": cart_item.price,
+        "quantity": cart_item.quantity
+    }
+    result = await cart_collection.insert_one(cart_data)
+    
+    if result.acknowledged:
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true",
+        }
+        return JSONResponse(content={"message": "Item added to cart", "cart_item_id": str(result.inserted_id)}, headers=headers)
+    
+    raise HTTPException(status_code=500, detail="Failed to add item to cart")
+
+
+
+@app.options("/cart/remove")
+async def options_feedback():
+    """
+    Handle the OPTIONS method for /feedback to allow CORS preflight requests.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+
+# Update remove route to accept clothing_id as a query parameter instead of the body
+@app.post("/cart/remove")
+async def remove_from_cart(clothing_id: str, current_user: dict = Depends(get_current_user)):
+    # Remove the item from the cart
+    result = await cart_collection.delete_one({"user_id": current_user["user_id"], "clothing_id": clothing_id})
+    
+    if result.deleted_count == 1:
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true",
+        }
+        return JSONResponse(content={"message": "Item removed from cart"}, headers=headers)
+    
+    raise HTTPException(status_code=404, detail="Item not found in cart")
+
+
+
+@app.options("/cart")
+async def options_feedback():
+    """
+    Handle the OPTIONS method for /feedback to allow CORS preflight requests.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+
+# Route to get all items in the cart
+@app.get("/cart")
+async def get_cart_items(current_user: dict = Depends(get_current_user)):
+    cart_items = await cart_collection.find({"user_id": current_user["user_id"]}).to_list(100)
+    
+    if not cart_items:
+        raise HTTPException(status_code=404, detail="Cart is empty")
+    
+    # Convert cart items to a list of dictionaries
+    cart_data = pd.DataFrame(cart_items).to_dict(orient="records")
+    
+    # Ensure ObjectId is converted to string for each item
+    for item in cart_data:
+        if "_id" in item:
+            item["_id"] = str(item["_id"])
+    
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    
+    return JSONResponse(content={"cart_items": cart_data}, headers=headers)
