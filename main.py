@@ -88,6 +88,13 @@ class ClothingItem(BaseModel):
     brand: str
     size: List[str]
 
+# Model for checkout item
+class CheckoutItem(BaseModel):
+    clothing_id: str
+    item_name: str
+    price: float
+    quantity: int = 1
+
 # Model for CartItem
 class CartItem(BaseModel):
     clothing_id: str
@@ -553,3 +560,97 @@ async def get_cart_items(current_user: dict = Depends(get_current_user)):
     }
     
     return JSONResponse(content={"cart_items": cart_data}, headers=headers)
+
+
+@app.options("/create-checkout-session")
+async def options_feedback():
+    """
+    Handle the OPTIONS method for /feedback to allow CORS preflight requests.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+# Route to create a Stripe checkout session
+@app.post("/create-checkout-session")
+async def create_checkout_session(items: List[CheckoutItem], current_user: dict = Depends(get_current_user)):
+    try:
+        # Convert your cart items into a format Stripe requires
+        line_items = [{
+            'price_data': {
+                'currency': 'usd',
+                'product_data': {
+                    'name': item.item_name,
+                },
+                'unit_amount': int(item.price * 100),  # Stripe expects the price in cents
+            },
+            'quantity': item.quantity,
+        } for item in items]
+
+        # Create the checkout session with shipping and billing information
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=line_items,
+            mode='payment',
+            success_url="http://localhost:3000/success?session_id={CHECKOUT_SESSION_ID}",  # Frontend success URL
+            cancel_url="http://localhost:3000/cancel",  # Frontend cancel URL
+
+            # Collect customer shipping address (optional, required, or no preference)
+            shipping_address_collection={
+                'allowed_countries': ['US', 'CA', 'GB']  # Limit shipping to specific countries
+            },
+            
+            # Collect billing information like email, address, and phone
+            billing_address_collection='required',  # 'auto' or 'required'
+            
+            # Optional: Define customer details like name and email if known
+            customer_email=current_user["email"],  # Using the email of the current user
+
+            # Optional: Define shipping options
+            shipping_options=[
+                {
+                    'shipping_rate_data': {
+                        'type': 'fixed_amount',
+                        'fixed_amount': {
+                            'amount': 500,  # Shipping cost in cents (e.g., $5.00)
+                            'currency': 'usd',
+                        },
+                        'display_name': 'Standard shipping',
+                        # Delivery estimate
+                        'delivery_estimate': {
+                            'minimum': {'unit': 'business_day', 'value': 5},
+                            'maximum': {'unit': 'business_day', 'value': 7},
+                        },
+                    },
+                },
+                {
+                    'shipping_rate_data': {
+                        'type': 'fixed_amount',
+                        'fixed_amount': {
+                            'amount': 1500,  # Shipping cost in cents (e.g., $15.00)
+                            'currency': 'usd',
+                        },
+                        'display_name': 'Express shipping',
+                        'delivery_estimate': {
+                            'minimum': {'unit': 'business_day', 'value': 1},
+                            'maximum': {'unit': 'business_day', 'value': 3},
+                        },
+                    },
+                },
+            ]
+        )
+
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true",
+        }
+
+        # Return session ID with headers
+        return JSONResponse(content={"sessionId": session.id}, headers=headers)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
