@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Request
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from model import get_image_for_prediction  # Import the prediction logic
 import tensorflow as tf
 from contextlib import asynccontextmanager
@@ -19,6 +19,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import pandas as pd
 import numpy as np
 import stripe
+from bson import ObjectId
 
 
 # Define constants
@@ -54,6 +55,7 @@ collection = db['clothing_catalog']
 feedback_collection = db['user_feedback']  # Feedback collection
 user_collection = db['user']  # Users collection
 cart_collection = db['cart']
+closet_collection = db['closet']
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
@@ -94,6 +96,22 @@ class CheckoutItem(BaseModel):
     item_name: str
     price: float
     quantity: int = 1
+
+# Model for items that will be stored in the closet collection
+class ClosetItem(BaseModel):
+    clothing_id: str
+    item_name: str
+    image_url: Optional[str]  # Make the image URL optional
+    purchase_date: Optional[datetime] = None  # Will be set at the time of insertion
+    price: float
+
+class ClosetItemResponse(BaseModel):
+    clothing_id: str
+    item_name: str
+    image_url: Optional[str]
+    purchase_date: datetime
+    price: float
+
 
 # Model for CartItem
 class CartItem(BaseModel):
@@ -152,16 +170,34 @@ async def create_user(user: User):
         return {"message": "User created successfully", "user_id": user_data["user_id"]}
     raise HTTPException(status_code=500, detail="Failed to create user")
 
+@app.options("/login")
+async def options_recommend():
+    """
+    Handle the OPTIONS method for /recommend to allow CORS preflight requests.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
 @app.post("/login")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = await user_collection.find_one({"email": form_data.username})
     
     if user and verify_password(form_data.password, user["password"]):
         access_token = create_access_token(data={"sub": user["user_id"]})
-        headers = {"Access-Control-Allow-Origin": "http://localhost:3000", 
-                   "Access-Control-Allow-Credentials": "true"}
+        # Adding CORS headers like a pro
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000", 
+            "Access-Control-Allow-Credentials": "true"
+        }
+        # Serve up that response with headers like a gourmet dish
         return JSONResponse(content={"access_token": access_token, "token_type": "bearer"}, headers=headers)
     
+    # Oops, bad credentials! 🙅‍♂️
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
 # Token verification dependency
@@ -654,3 +690,125 @@ async def create_checkout_session(items: List[CheckoutItem], current_user: dict 
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        
+
+
+@app.options("/digital-closet")
+async def options_digital_closet():
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",  # Frontend URL
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+@app.get("/digital-closet")
+async def get_digital_closet_items(current_user: dict = Depends(get_current_user)):
+    try:
+        # Fetch closet items based on user_id
+        closet_items = await closet_collection.find({"user_id": current_user["user_id"]}).to_list(100)
+
+        # Log the fetched items
+        print(f"Closet Items Fetched: {closet_items}")
+
+        # If no items are found, raise a 404 exception
+        if not closet_items:
+            raise HTTPException(status_code=404, detail="No items found in your digital closet.")
+
+        # Convert ObjectId to string before returning the response
+        for item in closet_items:
+            if '_id' in item:
+                item['_id'] = str(item['_id'])  # Convert ObjectId to string
+
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true",
+        }
+
+        # Log the success message and return the items
+        print(f"Returning closet items for user {current_user['user_id']}")
+        return JSONResponse(content=closet_items, headers=headers)
+
+    except Exception as e:
+        # Log the error and raise HTTPException
+        print(f"Error occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+
+        
+@app.options("/purchase-success")
+async def options_feedbackS():
+   
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",  # Allow requests from the frontend
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+@app.post("/purchase-success")
+async def purchase_success(stripe_session_id: str, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+    """
+    Handles the successful purchase and updates the user's closet with the purchased items.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",  # Allow requests from the frontend
+        "Access-Control-Allow-Credentials": "true",
+    }
+    
+    try:
+        # Example logic for handling purchase success:
+        # Fetch the Stripe session details using the session_id (pseudo-code)
+        session = await stripe.checkout.Session.retrieve(stripe_session_id)
+        
+        # Extract user and order details from session (e.g., session.metadata)
+        user_id = current_user["user_id"]
+        purchased_items = session["metadata"]["items"]  # Assuming items metadata
+        
+        # Add items to the user's digital closet in MongoDB
+        for item in purchased_items:
+            await closet_collection.insert_one({
+                "user_id": user_id,
+                "item_name": item["name"],
+                "price": item["price"],
+                "purchase_date": session["created"],  # Timestamp from Stripe session
+                "clothing_id": item["clothing_id"],
+                "image_url": item["image_url"],
+            })
+
+        return JSONResponse(content={"message": "Purchase processed and closet updated successfully"}, headers=headers)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing purchase: {str(e)}")
+
+
+
+
+@app.options("/stripe-session/{session_id}")
+async def options_stripe_session():
+    """
+    Handle the OPTIONS method for /stripe-session to allow CORS preflight requests.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Credentials": "true",
+    }
+    return JSONResponse(content={}, headers=headers)
+
+
+
+
+@app.get("/stripe-session/{session_id}")
+async def get_stripe_session(session_id: str):
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+        return JSONResponse(content={"id": session.id, "amount_total": session.amount_total}, headers={
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true"
+        })
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
