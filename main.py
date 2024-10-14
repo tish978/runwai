@@ -20,6 +20,7 @@ import pandas as pd
 import numpy as np
 import stripe
 from bson import ObjectId
+import json
 
 
 # Define constants
@@ -79,6 +80,10 @@ async def lifespan(app: FastAPI):
 # Use the lifespan context in the FastAPI app
 app = FastAPI(lifespan=lifespan)
 
+# Define a Pydantic model for the request body
+class PurchaseSuccessRequest(BaseModel):
+    stripe_session_id: str
+
 # Models for user and clothing items
 class ClothingItem(BaseModel):
     clothing_id: str
@@ -89,6 +94,10 @@ class ClothingItem(BaseModel):
     colors_available: List[str]
     brand: str
     size: List[str]
+
+# Define a Pydantic model for the request body
+class RemoveSavedItemRequest(BaseModel):
+    item_id: str
 
 # Model for checkout item
 class CheckoutItem(BaseModel):
@@ -262,7 +271,7 @@ async def async_predict_user_like(item_id: str):
 
 
 # Content-Based Recommendation System
-def recommend_items(liked_items, clothing_data, cosine_sim):
+def recommend_items(liked_items, disliked_items, clothing_data, cosine_sim):
     recommended_items = set()
 
     for item_id in liked_items:
@@ -275,10 +284,14 @@ def recommend_items(liked_items, clothing_data, cosine_sim):
         # Sort items by similarity score
         similarity_scores = sorted(similarity_scores, key=lambda x: x[1], reverse=True)
 
-        # Get the index of the top similar item (excluding the liked item itself and already recommended/liked items)
-        similar_items_indices = [i for i, _ in similarity_scores[1:] if clothing_data.iloc[i]['clothing_id'] not in liked_items]
+        # Get the index of the top similar item (excluding liked and disliked items)
+        similar_items_indices = [
+            i for i, _ in similarity_scores[1:]  # Skip the first item since it's the liked item itself
+            if clothing_data.iloc[i]['clothing_id'] not in liked_items
+            and clothing_data.iloc[i]['clothing_id'] not in disliked_items  # Exclude disliked items as well
+        ]
 
-        # Add the similar item(s) to the recommendation list (making sure it's not already liked)
+        # Add the similar items to the recommendation list (ensure no duplicates)
         recommended_items.update(clothing_data.iloc[similar_items_indices]['clothing_id'].tolist())
 
     return list(recommended_items)
@@ -297,11 +310,13 @@ async def options_recommend():
     }
     return JSONResponse(content={}, headers=headers)
 
+
 @app.get("/recommend")
 async def recommend_clothing(current_user: dict = Depends(get_current_user)):
-    # Get user feedback history
-    user_feedback = await feedback_collection.find({"user_id": current_user["user_id"], "liked": True}).to_list(100)
-    liked_items = [feedback["item_id"] for feedback in user_feedback]
+    # Get user feedback history (liked and disliked items)
+    user_feedback = await feedback_collection.find({"user_id": current_user["user_id"]}).to_list(100)
+    liked_items = [feedback["item_id"] for feedback in user_feedback if feedback["liked"]]
+    disliked_items = [feedback["item_id"] for feedback in user_feedback if not feedback["liked"]]
 
     if not liked_items:
         raise HTTPException(status_code=404, detail="No liked items found for recommendation.")
@@ -316,8 +331,8 @@ async def recommend_clothing(current_user: dict = Depends(get_current_user)):
     tfidf_matrix = tfidf_vectorizer.fit_transform(clothing_data['combined_features'])
     cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
 
-    # Get recommendations based on liked items
-    recommended_items = recommend_items(liked_items, clothing_data, cosine_sim)
+    # Get recommendations based on liked items, excluding disliked items
+    recommended_items = recommend_items(liked_items, disliked_items, clothing_data, cosine_sim)
 
     if not recommended_items:
         raise HTTPException(status_code=404, detail="No recommendations available.")
@@ -346,6 +361,7 @@ async def recommend_clothing(current_user: dict = Depends(get_current_user)):
     
     # If no items were recommended, raise an exception
     raise HTTPException(status_code=404, detail="No recommendation could be made.")
+
 
 
 
@@ -455,11 +471,10 @@ async def options_feedback():
     return JSONResponse(content={}, headers=headers)
 
 
-# Route to remove an item from saved items (user feedback)
 @app.post("/saved-items/remove")
-async def remove_saved_item(item_id: str, current_user: dict = Depends(get_current_user)):
-    # Remove the item from the saved items (feedback) collection
-    result = await feedback_collection.delete_one({"user_id": current_user["user_id"], "item_id": item_id})
+async def remove_saved_item(body: RemoveSavedItemRequest, current_user: dict = Depends(get_current_user)):
+    # Use the item_id from the request body
+    result = await feedback_collection.delete_one({"user_id": current_user["user_id"], "item_id": body.item_id})
 
     if result.deleted_count == 1:
         headers = {
@@ -543,12 +558,29 @@ async def options_feedback():
     return JSONResponse(content={}, headers=headers)
 
 
-# Update remove route to accept clothing_id as a query parameter instead of the body
 @app.post("/cart/remove")
 async def remove_from_cart(clothing_id: str, current_user: dict = Depends(get_current_user)):
-    # Remove the item from the cart
+    """
+    Removes an item from the cart based on clothing_id for the current user.
+    """
+    # First, check if the item exists in the cart
+    existing_cart_item = await cart_collection.find_one({"user_id": current_user["user_id"], "clothing_id": clothing_id})
+
+    if not existing_cart_item:
+        # Item not found in the cart, return a friendly message
+        headers = {
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Credentials": "true",
+        }
+        return JSONResponse(
+            content={"message": "Item not found in cart or already removed."}, 
+            status_code=404, 
+            headers=headers
+        )
+
+    # Now try to remove the item
     result = await cart_collection.delete_one({"user_id": current_user["user_id"], "clothing_id": clothing_id})
-    
+
     if result.deleted_count == 1:
         headers = {
             "Access-Control-Allow-Origin": "http://localhost:3000",
@@ -556,7 +588,10 @@ async def remove_from_cart(clothing_id: str, current_user: dict = Depends(get_cu
         }
         return JSONResponse(content={"message": "Item removed from cart"}, headers=headers)
     
-    raise HTTPException(status_code=404, detail="Item not found in cart")
+    # If somehow it still fails, return an error
+    raise HTTPException(status_code=500, detail="Failed to remove item from cart")
+
+
 
 
 
@@ -574,7 +609,6 @@ async def options_feedback():
     return JSONResponse(content={}, headers=headers)
 
 
-# Route to get all items in the cart
 @app.get("/cart")
 async def get_cart_items(current_user: dict = Depends(get_current_user)):
     cart_items = await cart_collection.find({"user_id": current_user["user_id"]}).to_list(100)
@@ -596,6 +630,7 @@ async def get_cart_items(current_user: dict = Depends(get_current_user)):
     }
     
     return JSONResponse(content={"cart_items": cart_data}, headers=headers)
+
 
 
 @app.options("/create-checkout-session")
@@ -690,7 +725,8 @@ async def create_checkout_session(items: List[CheckoutItem], current_user: dict 
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
+
+
 
 
 @app.options("/digital-closet")
@@ -738,7 +774,7 @@ async def get_digital_closet_items(current_user: dict = Depends(get_current_user
 
         
 @app.options("/purchase-success")
-async def options_feedbackS():
+async def options_purchase_success():
    
     headers = {
         "Access-Control-Allow-Origin": "http://localhost:3000",  # Allow requests from the frontend
@@ -749,39 +785,52 @@ async def options_feedbackS():
     return JSONResponse(content={}, headers=headers)
 
 @app.post("/purchase-success")
-async def purchase_success(stripe_session_id: str, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
-    """
-    Handles the successful purchase and updates the user's closet with the purchased items.
-    """
+async def purchase_success(request: PurchaseSuccessRequest, current_user: dict = Depends(get_current_user)):
+    stripe_session_id = request.stripe_session_id
+    print(f"Received session ID: {stripe_session_id}")
+    
     headers = {
         "Access-Control-Allow-Origin": "http://localhost:3000",  # Allow requests from the frontend
         "Access-Control-Allow-Credentials": "true",
     }
-    
+
     try:
-        # Example logic for handling purchase success:
-        # Fetch the Stripe session details using the session_id (pseudo-code)
-        session = await stripe.checkout.Session.retrieve(stripe_session_id)
-        
-        # Extract user and order details from session (e.g., session.metadata)
-        user_id = current_user["user_id"]
-        purchased_items = session["metadata"]["items"]  # Assuming items metadata
-        
-        # Add items to the user's digital closet in MongoDB
-        for item in purchased_items:
-            await closet_collection.insert_one({
-                "user_id": user_id,
-                "item_name": item["name"],
-                "price": item["price"],
-                "purchase_date": session["created"],  # Timestamp from Stripe session
+        # Retrieve the Stripe session using the session_id (without `await`)
+        session = stripe.checkout.Session.retrieve(stripe_session_id)
+
+        # Log the session to see what's returned
+        print(f"Stripe Session: {session}")
+
+        # Retrieve the cart items for the current user
+        cart_items = await cart_collection.find({"user_id": current_user["user_id"]}).to_list(100)
+
+        # Check if the cart is empty
+        if not cart_items:
+            raise HTTPException(status_code=404, detail="Cart is empty or no items found for the user.")
+
+        # Loop through cart items and add them to the user's digital closet
+        for item in cart_items:
+            closet_item = {
+                "user_id": current_user["user_id"],
                 "clothing_id": item["clothing_id"],
-                "image_url": item["image_url"],
-            })
+                "item_name": item["item_name"],
+                "price": float(item["price"]),
+                "purchase_date": datetime.utcnow(),
+                "image_url": item.get("image_url", None)  # Handle optional image URL
+            }
+            await closet_collection.insert_one(closet_item)
+
+        # Clear the cart for the user after purchase
+        await cart_collection.delete_many({"user_id": current_user["user_id"]})
 
         return JSONResponse(content={"message": "Purchase processed and closet updated successfully"}, headers=headers)
 
     except Exception as e:
+        print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing purchase: {str(e)}")
+
+
+
 
 
 
